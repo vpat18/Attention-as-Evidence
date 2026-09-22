@@ -176,6 +176,22 @@ def predict(model, dl, device, tta: bool):
 
 
 # ---------------------------------------------------------------- train ---
+@torch.no_grad()
+def validate_loss(model, dl, device, criterion):
+    model.eval()
+    total, n = 0.0, 0
+
+    for x, y in dl:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        with torch.autocast("cuda", enabled=device.type == "cuda"):
+            loss = criterion(model(x), y)
+
+        total += loss.item() * len(x)
+        n += len(x)
+
+    return total / n
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--img", type=int, default=224)
@@ -237,6 +253,8 @@ def main():
         ], weight_decay=1e-4)
 
     start_epoch, best, history = 1, -1.0, []
+    patience = 3
+    epochs_without_improvement = 0
     opt, sched = None, None
     ckpt_best = WORK / f"densenet121_full{args.img}.pt"
     last = WORK / "last.pt"
@@ -274,48 +292,114 @@ def main():
         if sched is not None:
             sched.step()
 
+        val_loss = validate_loss(model, val_dl, device, crit)
+
         yv, pv = predict(model, val_dl, device, tta=False)
         auroc = macro_auroc(yv, pv)
         history.append({"stage": stage, "epoch": epoch, "train_loss": tot / n,
-                        "val_loss": float("nan"), "val_auroc": auroc,
+                        "val_loss": val_loss, "val_auroc": auroc,
                         "minutes": (time.time() - t0) / 60})
         flag = ""
         if auroc > best:
-            best, flag = auroc, "  *"
-            torch.save({"model": "densenet121_imagenet", "source": "kaggle_full_nih",
-                        "img": args.img, "epoch": epoch, "state_dict": model.state_dict(),
-                        "spec": {"in_channels": 3, "norm": "imagenet"},
-                        "classes": CLASSES, "val_auroc": auroc}, ckpt_best)
-        print(f"epoch {epoch} stage {stage}  train {tot / n:.4f}  val AUROC {auroc:.4f}{flag}  "
-              f"({(time.time() - t0) / 60:.1f} min)", flush=True)
-        torch.save({"model": model.state_dict(), "epoch": epoch, "best": best,
-                    "history": history}, last)
+            best = auroc
+            flag = "  *"
+            epochs_without_improvement = 0
+
+            torch.save({
+                 "model": model.state_dict(),
+                 "epoch": epoch,
+                 "auroc": auroc
+            }, WORK / "best.pt")
+
+        else:
+            epochs_without_improvement += 1
+
+
+
+        print(f"epochs without improvement: {epochs_without_improvement}")
+
+        print(
+            f"epoch {epoch} stage {stage}  train {tot / n:.4f}  "
+            f"val AUROC {auroc:.4f}{flag}  "
+            f"({(time.time() - t0) / 60:.1f} min)",
+            flush=True
+        )
+
+        torch.save({
+            "model": model.state_dict(),
+            "epoch": epoch,
+            "best": best,
+            "history": history
+        }, last)
+
         pd.DataFrame(history).to_csv(WORK / "history.csv", index=False)
 
+        # Early stopping
+        if epochs_without_improvement >= patience:
+            print(f"Early stopping triggered at epoch {epoch}")
+            break
+
+        # Time budget
         elapsed_h = (time.time() - t_start) / 3600
         per_epoch_h = (time.time() - t0) / 3600
+
         if epoch < args.epochs and elapsed_h + per_epoch_h * 1.3 > args.max_hours:
-            print(f"stopping: {elapsed_h:.1f} h used, next epoch would exceed budget")
+            print(
+                f"stopping: {elapsed_h:.1f} h used, "
+                f"next epoch would exceed budget"
+            )
             break
 
     # ---- final test evaluation with the best checkpoint --------------------
     state = torch.load(ckpt_best, map_location="cpu", weights_only=False)
     model.load_state_dict(state["state_dict"])
+
     yt, pt = predict(model, test_dl, device, tta=True)
-    per_class = {c: float(roc_auc_score(yt[:, i], pt[:, i])) for i, c in enumerate(CLASSES)
-                 if 0 < yt[:, i].sum() < len(yt)}
-    summary = {"model": f"densenet121_full{args.img}", "img": args.img,
-               "n_train": len(train), "n_val": len(val), "n_test": len(test),
-               "best_val_auroc": best,
-               "test_macro_auroc_tta": float(np.mean(list(per_class.values()))),
-               "test_per_class_auroc": per_class, "epochs_run": len(history),
-               "hours": (time.time() - t_start) / 3600}
-    np.savez(WORK / "full_test_preds.npz", images=np.array(test.image.tolist()),
-             y_true=yt, y_prob=pt)
-    (WORK / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(json.dumps({k: v for k, v in summary.items() if k != "test_per_class_auroc"}, indent=2))
-    print("test per-class AUROC:", {k: round(v, 3) for k, v in per_class.items()})
-    print("done. download: densenet121_full*.pt, full_test_preds.npz, history.csv, summary.json")
+
+    per_class = {
+        c: float(roc_auc_score(yt[:, i], pt[:, i]))
+        for i, c in enumerate(CLASSES)
+        if 0 < yt[:, i].sum() < len(yt)
+    }
+
+    summary = {
+        "model": f"densenet121_full{args.img}",
+        "img": args.img,
+        "n_train": len(train),
+        "n_val": len(val),
+        "n_test": len(test),
+        "best_val_auroc": best,
+        "test_macro_auroc_tta": float(np.mean(list(per_class.values()))),
+        "test_per_class_auroc": per_class,
+        "epochs_run": len(history),
+        "hours": (time.time() - t_start) / 3600
+    }
+
+    np.savez(
+        WORK / "full_test_preds.npz",
+        images=np.array(test.image.tolist()),
+        y_true=yt,
+        y_prob=pt
+    )
+
+    (WORK / "summary.json").write_text(
+        json.dumps(summary, indent=2)
+    )
+
+    print(json.dumps(
+        {k: v for k, v in summary.items() if k != "test_per_class_auroc"},
+        indent=2
+    ))
+
+    print(
+        "test per-class AUROC:",
+        {k: round(v, 3) for k, v in per_class.items()}
+    )
+
+    print(
+        "done. download: densenet121_full*.pt, "
+        "full_test_preds.npz, history.csv, summary.json"
+    )
 
 
 if __name__ == "__main__":
